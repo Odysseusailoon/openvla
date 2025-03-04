@@ -151,6 +151,8 @@ class MoEOpenVLAConfig(OpenVLAConfig):
         num_selected_experts: int = 2,
         expert_dropout: float = 0.1,
         load_balancing_loss_weight: float = 0.01,
+        vocab_size: Optional[int] = None,
+        hidden_size: Optional[int] = None,
         **kwargs: str,
     ) -> None:
         self.num_experts = num_experts
@@ -158,4 +160,17 @@ class MoEOpenVLAConfig(OpenVLAConfig):
         self.expert_dropout = expert_dropout
         self.load_balancing_loss_weight = load_balancing_loss_weight
         
+        if vocab_size is not None:
+            self.vocab_size = vocab_size
+        if hidden_size is not None:
+            self.hidden_size = hidden_size
+        
         super().__init__(norm_stats=norm_stats, n_action_bins=n_action_bins, **kwargs)
+        
+        if not hasattr(self, 'vocab_size') and hasattr(self, 'text_config'):
+            if hasattr(self.text_config, 'vocab_size'):
+                self.vocab_size = self.text_config.vocab_size
+                
+        if not hasattr(self, 'hidden_size') and hasattr(self, 'text_config'):
+            if hasattr(self.text_config, 'hidden_size'):
+                self.hidden_size = self.text_config.hidden_size
