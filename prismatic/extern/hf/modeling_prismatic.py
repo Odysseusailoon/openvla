@@ -22,6 +22,7 @@ import timm
 import tokenizers
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
@@ -517,6 +518,8 @@ class MixOfExperts(nn.Module):
         self.num_selected_experts = config.num_selected_experts
         self.expert_dropout = config.expert_dropout
         self.load_balancing_loss_weight = config.load_balancing_loss_weight
+        self.input_size = input_size
+        self.output_size = output_size
         
         # Create expert networks
         self.experts = nn.ModuleList([
@@ -526,14 +529,95 @@ class MixOfExperts(nn.Module):
         # Router network to select experts
         self.router = nn.Linear(input_size, self.num_experts)
         
+        # Initialize router weights
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
+        if hasattr(self.router, 'bias') and self.router.bias is not None:
+            nn.init.zeros_(self.router.bias)
+        
     def forward(self, x):
-        # Simplified MoE forward implementation
-        # In real implementation, would route inputs to selected experts
-        router_logits = self.router(x)
-        return self.experts[0](x), {"aux_loss": torch.tensor(0.0)}
+        """
+        Forward pass through the MoE layer.
+        
+        Args:
+            x: Input tensor of shape [batch_size, hidden_size]
+            
+        Returns:
+            Tuple of (output, aux_loss)
+        """
+        batch_size = x.shape[0]
+        
+        # Get router logits
+        router_logits = self.router(x)  # [batch_size, num_experts]
+        
+        # Add a small amount of noise to encourage exploration during training
+        if self.training:
+            router_logits += torch.randn_like(router_logits) * 1e-2
+        
+        # Get routing probabilities with softmax
+        routing_weights = F.softmax(router_logits, dim=-1)  # [batch_size, num_experts]
+        
+        # Calculate auxiliary load balancing loss
+        # We want each expert to be used equally across the batch
+        aux_loss = self._calculate_load_balancing_loss(routing_weights)
+        
+        # Select top-k experts per token
+        top_k_weights, top_k_indices = torch.topk(
+            routing_weights, k=self.num_selected_experts, dim=-1
+        )  # Both: [batch_size, num_selected_experts]
+        
+        # Normalize the weights
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        
+        # Initialize output tensor
+        final_output = torch.zeros(
+            (batch_size, self.output_size), 
+            device=x.device, 
+            dtype=x.dtype
+        )
+        
+        # For each expert, calculate its output and combine with weights
+        for expert_idx in range(self.num_experts):
+            # Find which batch items use this expert
+            expert_mask = (top_k_indices == expert_idx).any(dim=-1)
+            
+            if not expert_mask.any():
+                continue  # Skip if no batch items use this expert
+                
+            # Get the corresponding inputs
+            expert_inputs = x[expert_mask]
+            
+            # Apply the expert
+            expert_output = self.experts[expert_idx](expert_inputs)
+            
+            # For each batch item using this expert, find its weight
+            for i, batch_idx in enumerate(torch.where(expert_mask)[0]):
+                # Find which position this expert has in the top_k for this item
+                expert_positions = (top_k_indices[batch_idx] == expert_idx).nonzero(as_tuple=True)[0]
+                for pos in expert_positions:
+                    weight = top_k_weights[batch_idx, pos]
+                    final_output[batch_idx] += expert_output[i] * weight
+        
+        return final_output, aux_loss * self.load_balancing_loss_weight
+        
+    def _calculate_load_balancing_loss(self, routing_weights):
+        """
+        Calculate auxiliary load balancing loss to ensure all experts are used equally.
+        
+        Args:
+            routing_weights: Routing weight tensor [batch_size, num_experts]
+            
+        Returns:
+            Load balancing loss
+        """
+        # Fraction of tokens routed to each expert
+        routing_prob = routing_weights.mean(dim=0)
+        # Ideal routing probability (uniform)
+        target_prob = torch.ones_like(routing_prob) / self.num_experts
+        # L2 loss compared to uniform distribution
+        return F.mse_loss(routing_prob, target_prob)
     
     def from_pretrained_layers(self, original_layer):
-        # Initialize all experts with the pretrained weights
+        """Initialize all experts with the pretrained weights."""
         for expert in self.experts:
             if hasattr(original_layer, 'weight'):
                 expert.weight.data.copy_(original_layer.weight.data)
@@ -548,9 +632,74 @@ class MoEOpenVLAForActionPrediction(OpenVLAForActionPrediction):
     
     def __init__(self, config):
         super().__init__(config)
-        # Add MoE layer
+        
+        # Add MoE layer - make sure it's compatible with your converted model
         self.action_moe = MixOfExperts(
             config,
             config.hidden_size,
             config.vocab_size
         )
+        
+        # Attribute to track MoE losses
+        self.moe_loss = 0.0
+        
+    def forward(
+        self, 
+        input_ids=None,
+        attention_mask=None,
+        pixel_values=None,
+        labels=None,
+        **kwargs
+    ):
+        # Reset MoE loss
+        self.moe_loss = 0.0
+        
+        # First get the regular model outputs
+        outputs = super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            labels=labels,
+            **kwargs
+        )
+        
+        # If there's no model.lm_head used in the original model, just return outputs
+        if not hasattr(self, 'action_moe'):
+            return outputs
+            
+        # Check if we can get hidden states - extract last token representation
+        if hasattr(self.model, 'lm_head') and hasattr(outputs, 'logits'):
+            # Extract the features before the lm_head
+            batch_size = outputs.logits.shape[0]
+            hidden_states = torch.zeros(
+                (batch_size, self.config.hidden_size),
+                device=outputs.logits.device,
+                dtype=outputs.logits.dtype
+            )
+            
+            # Get hidden states from model if available
+            if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+                # Last layer, last token
+                if isinstance(outputs.hidden_states, tuple):
+                    hidden_states = outputs.hidden_states[-1][:, -1, :]
+                else:
+                    hidden_states = outputs.hidden_states[:, -1, :]
+            
+            # Apply MoE layer
+            moe_logits, aux_loss = self.action_moe(hidden_states)
+            
+            # Store the auxiliary loss
+            self.moe_loss = aux_loss
+            
+            # Replace the logits for the last position with MoE logits
+            if len(outputs.logits.shape) == 3:  # [batch, seq, vocab]
+                # Only replace the last token logits
+                outputs.logits[:, -1, :] = moe_logits
+            else:  # [batch, vocab]
+                outputs.logits = moe_logits
+                
+            # Update the loss if needed
+            if hasattr(outputs, 'loss') and outputs.loss is not None:
+                outputs.loss = outputs.loss + self.moe_loss
+                
+        return outputs
