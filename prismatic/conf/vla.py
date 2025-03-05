@@ -197,6 +197,32 @@ class Exp_SigLIP_224px_Droid_Wipe(Exp_SigLIP_224px_Bridge):
 
     data_mix: str = "droid_wipe"
 
+@dataclass
+class Exp_DinoSigLIP_224px_Modified_Libero(Exp_SigLIP_224px_Bridge):  # Changed parent class
+    """DINO+SigLIP-224px with Llama 2 7B, fine-tuned on Modified Libero dataset."""
+
+    vla_id = "dino+siglip-224px_llama-2-7b_modified-libero"
+    
+    # Use the original OpenVLA model
+    base_vlm = "openvla/openvla-7b-prismatic"
+    
+    # Use your custom data mix
+    data_mix = "modified_libero_rlds"
+    
+    # Full fine-tuning settings (this will trigger "vla-full-train" stage)
+    freeze_vision_backbone = False
+    freeze_llm_backbone = False
+    unfreeze_last_llm_layer = True
+    
+    # Training parameters
+    learning_rate = 1e-5
+    global_batch_size = 32
+    per_device_batch_size = 4
+    
+    # This is inherited from Exp_SigLIP_224px_Bridge which has expected_world_size = 8
+    # No need to explicitly set it here
+
+
 
 # === Define a VLA Registry Enum for Reference & Validation ===
 @unique
@@ -224,6 +250,9 @@ class VLARegistry(Enum):
 
     # === DROID Fine-tuning Configs ===
     SIGLIP_224PX_MX_DROID_WIPE = Exp_SigLIP_224px_Droid_Wipe
+    
+    # === Modified Libero Fine-tuning Config ===
+    DINOSIGLIP_224PX_MODIFIED_LIBERO = Exp_DinoSigLIP_224px_Modified_Libero
 
     @property
     def vla_id(self) -> str:
@@ -233,3 +262,5 @@ class VLARegistry(Enum):
 # Register VLAs in Choice Registry
 for vla_variant in VLARegistry:
     VLAConfig.register_subclass(vla_variant.vla_id, vla_variant.value)
+
+

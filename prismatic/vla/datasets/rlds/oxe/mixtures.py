@@ -206,5 +206,9 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
     "libero_10_no_noops": [
         ("libero_10_no_noops", 1.0),
     ],
+    # === Modified LIBERO RLDS ===
+     "modified_libero_rlds": [
+        ("modified_libero_rlds", 1.0),
+    ],
 }
 # fmt: on
