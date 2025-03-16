@@ -26,7 +26,6 @@ Usage:
 import argparse
 import json
 import os
-import time
 
 import h5py
 import numpy as np
@@ -38,7 +37,6 @@ from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
 )
-
 
 IMAGE_RESOLUTION = 256
 
@@ -73,8 +71,11 @@ def main(args):
 
     # Create target directory
     if os.path.isdir(args.libero_target_dir):
-        user_input = input(f"Target directory already exists at path: {args.libero_target_dir}\nEnter 'y' to overwrite the directory, or anything else to exit: ")
-        if user_input != 'y':
+        user_input = input(
+            f"Target directory already exists at path: {args.libero_target_dir}\n"
+            "Enter 'y' to overwrite the directory, or anything else to exit: "
+        )
+        if user_input != "y":
             exit()
     os.makedirs(args.libero_target_dir, exist_ok=True)
 
@@ -219,7 +220,8 @@ def main(args):
 
             # Count total number of successful replays so far
             print(
-                f"Total # episodes replayed: {num_replays}, Total # successes: {num_success} ({num_success / num_replays * 100:.1f} %)"
+                f"Total # episodes replayed: {num_replays}, "
+                f"Total # successes: {num_success} ({num_success / num_replays * 100:.1f} %)"
             )
 
             # Report total number of no-op actions filtered out so far
@@ -237,12 +239,25 @@ def main(args):
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--libero_task_suite", type=str, choices=["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"],
-                        help="LIBERO task suite. Example: libero_spatial", required=True)
-    parser.add_argument("--libero_raw_data_dir", type=str,
-                        help="Path to directory containing raw HDF5 dataset. Example: ./LIBERO/libero/datasets/libero_spatial", required=True)
-    parser.add_argument("--libero_target_dir", type=str,
-                        help="Path to regenerated dataset directory. Example: ./LIBERO/libero/datasets/libero_spatial_no_noops", required=True)
+    parser.add_argument(
+        "--libero_task_suite",
+        type=str,
+        choices=["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"],
+        help="LIBERO task suite. Example: libero_spatial",
+        required=True,
+    )
+    parser.add_argument(
+        "--libero_raw_data_dir",
+        type=str,
+        help=("Path to directory containing raw HDF5 dataset. " "Example: ./LIBERO/libero/datasets/libero_spatial"),
+        required=True,
+    )
+    parser.add_argument(
+        "--libero_target_dir",
+        type=str,
+        help=("Path to regenerated dataset directory. " "Example: ./LIBERO/libero/datasets/libero_spatial_no_noops"),
+        required=True,
+    )
     args = parser.parse_args()
 
     # Start data regeneration
