@@ -186,6 +186,9 @@ def train(cfg: TrainConfig) -> None:
         f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
     )
 
+    # Before dataset loading
+    overwatch.info(f"Rank {dist.get_rank()}: Starting dataset loading")
+
     # Get VLA Dataset & Collator
     overwatch.info(f"Creating VLA Open-X Dataset with Mixture `{cfg.vla.data_mix}`")
     vla_dataset, action_tokenizer, collator = get_vla_dataset_and_collator(
@@ -198,6 +201,9 @@ def train(cfg: TrainConfig) -> None:
         shuffle_buffer_size=cfg.vla.shuffle_buffer_size,
         image_aug=cfg.image_aug,
     )
+
+    # After dataset is loaded
+    overwatch.info(f"Rank {dist.get_rank()}: Dataset loaded successfully, size={len(vla_dataset)}")
 
     # Save dataset statistics for de-normalization at inference time
     if overwatch.is_rank_zero():

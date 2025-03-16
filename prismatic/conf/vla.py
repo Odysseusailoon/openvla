@@ -198,7 +198,7 @@ class Exp_SigLIP_224px_Droid_Wipe(Exp_SigLIP_224px_Bridge):
     data_mix: str = "droid_wipe"
 
 @dataclass
-class Exp_DinoSigLIP_224px_Modified_Libero(Exp_SigLIP_224px_Bridge):  # Changed parent class
+class Exp_DinoSigLIP_224px_Modified_Libero(Exp_DinoSigLIP_224px_OXE_Magic_Soup_Plus):
     """DINO+SigLIP-224px with Llama 2 7B, fine-tuned on Modified Libero dataset."""
 
     vla_id = "dino+siglip-224px_llama-2-7b_modified-libero"
@@ -219,9 +219,8 @@ class Exp_DinoSigLIP_224px_Modified_Libero(Exp_SigLIP_224px_Bridge):  # Changed 
     global_batch_size = 32
     per_device_batch_size = 4
     
-    # This is inherited from Exp_SigLIP_224px_Bridge which has expected_world_size = 8
-    # No need to explicitly set it here
-
+    # Set expected world size based on your hardware
+    expected_world_size = 8
 
 
 # === Define a VLA Registry Enum for Reference & Validation ===
