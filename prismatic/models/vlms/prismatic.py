@@ -720,3 +720,52 @@ class PrismaticVLM(VLM):
 
         return generated_text
 
+    def apply_moe_lora(self):
+        """
+        Apply MoE-LoRA adapter to the LLM backbone.
+        This method wraps the LLM's MLP layers with MoE-LoRA adapters without modifying
+        the original model structure.
+        """
+        if hasattr(self, 'moe_applied') and self.moe_applied:
+            overwatch.info("MoE-LoRA has already been applied, skipping", ctx_level=1)
+            return
+        
+        overwatch.info(f"Applying MoE-LoRA with {self.moe_num_experts} experts (rank: {self.moe_lora_rank})", ctx_level=1)
+        
+        # Track layers that have been modified
+        modified_layers = 0
+        
+        # Apply MoE-LoRA to LLM model layers
+        if hasattr(self.llm_backbone, 'llm') and hasattr(self.llm_backbone.llm, 'model'):
+            if hasattr(self.llm_backbone.llm.model, 'layers'):
+                for i, layer in enumerate(self.llm_backbone.llm.model.layers):
+                    if hasattr(layer, 'mlp'):
+                        # Store original MLP
+                        original_mlp = layer.mlp
+                        
+                        # Create MoE-LoRA wrapper
+                        moe_mlp = LoRA_MOE_LM(
+                            args=self.moe_args,
+                            lora_rank=self.moe_lora_rank,
+                            lora_alpha=self.moe_lora_alpha,
+                            num_experts=self.moe_num_experts,
+                            original_module=original_mlp
+                        )
+                        
+                        # Replace the MLP with our MoE-LoRA version
+                        layer.mlp = moe_mlp
+                        modified_layers += 1
+                        
+                        # Only modify every other layer if not using dense MoE
+                        if not self.dense_moe and modified_layers % 2 == 1:
+                            continue
+        
+        # Mark as applied to prevent multiple applications
+        self.moe_applied = True
+        
+        overwatch.info(f"MoE-LoRA successfully applied to {modified_layers} layers", ctx_level=1)
+        
+        # Add to state dict keys for checkpoint saving
+        if "moe_applied" not in self.all_module_keys:
+            self.all_module_keys.append("moe_applied")
+
