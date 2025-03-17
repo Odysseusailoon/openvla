@@ -132,3 +132,35 @@ class LoRA_MOE_LM(nn.Module): # for llm
         else:
             x = self.forward_lora_moe_sparse(x, self.original_module.down_proj, index, self.moe_down)
         return x, (routing, expert_choice)
+
+    def state_dict(self, *args, **kwargs):
+        """
+        Ensure MoE-LoRA parameters are properly saved in state_dict
+        """
+        state_dict = super().state_dict(*args, **kwargs)
+        
+        # Store router weights explicitly
+        if not "router.weight" in state_dict:
+            state_dict["router.weight"] = self.router.weight
+        if hasattr(self.router, "bias") and self.router.bias is not None:
+            if not "router.bias" in state_dict:
+                state_dict["router.bias"] = self.router.bias
+        
+        # Ensure all expert parameters are included
+        for i in range(self.num_experts):
+            for param_type in ["gate", "up", "down"]:
+                prefix = f"moe_{param_type}.{i}"
+                for name in ["lora_A", "lora_B"]:
+                    key = f"{prefix}.{name}"
+                    if not key in state_dict:
+                        state_dict[key] = getattr(getattr(self, f"moe_{param_type}")[i], name)
+        
+        return state_dict
+    
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """
+        Handle loading MoE-LoRA parameters from state_dict
+        """
+        # Make sure our custom parameters get loaded properly
+        result = super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        return result
