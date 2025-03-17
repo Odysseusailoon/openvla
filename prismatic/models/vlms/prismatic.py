@@ -538,6 +538,11 @@ class PrismaticVLM(VLM):
             fused_attention_mask = torch.vstack([multimodal_attention_mask, unimodal_attention_mask])
             fused_labels = torch.vstack([multimodal_labels, unimodal_labels])
 
+        # Modify the LLM backbone handling for MoE-LoRA during inference
+        if self.use_moe_lora and not self.training:
+            # Monkey patch the forward method of MoE layers for inference
+            self._patch_moe_layers_for_inference(enable=True)
+        
         # Run LLM Forward --> returns CausalLMOutputWithPast!
         outputs = self.llm_backbone(
             input_ids=None,
@@ -551,6 +556,10 @@ class PrismaticVLM(VLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        
+        # Restore original behavior after inference
+        if self.use_moe_lora and not self.training:
+            self._patch_moe_layers_for_inference(enable=False)
         
         # Handle MoE LoRA balancing loss if applicable
         if self.use_moe_lora and self.training:
@@ -580,6 +589,36 @@ class PrismaticVLM(VLM):
                     outputs.loss = outputs.loss + (moe_balance_loss / len(routing_info)) * self.moe_balance_weight
         
         return outputs
+
+    def _patch_moe_layers_for_inference(self, enable=True):
+        """
+        Temporarily modify MoE layer forward methods during inference to handle tuple return values
+        """
+        if not hasattr(self, "_original_moe_forwards"):
+            self._original_moe_forwards = {}
+        
+        if hasattr(self.llm_backbone, 'llm') and hasattr(self.llm_backbone.llm, 'model'):
+            if hasattr(self.llm_backbone.llm.model, 'layers'):
+                for i, layer in enumerate(self.llm_backbone.llm.model.layers):
+                    if hasattr(layer, 'mlp') and isinstance(layer.mlp, LoRA_MOE_LM):
+                        if enable:
+                            # Store original forward method if not already stored
+                            if i not in self._original_moe_forwards:
+                                self._original_moe_forwards[i] = layer.mlp.forward
+                            
+                            # Replace with inference-friendly forward
+                            def make_inference_forward(original_forward):
+                                def inference_forward(x):
+                                    output, _ = original_forward(x)
+                                    return output
+                                return inference_forward
+                            
+                            layer.mlp.forward = make_inference_forward(layer.mlp.forward)
+                        else:
+                            # Restore original forward method
+                            if i in self._original_moe_forwards:
+                                layer.mlp.forward = self._original_moe_forwards[i]
+
     # === GenerationMixin Methods ===
     #   => Note: The following methods override the functionality of `transformers.GenerationMixin`; these expect the
     #            contract in each of the function signatures, and also expect our `forward` function to roughly take
