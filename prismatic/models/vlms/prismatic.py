@@ -28,6 +28,8 @@ from prismatic.overwatch import initialize_overwatch
 from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector
 from prismatic.models.backbones.llm.moe import LoRA_MOE_LM
 from dataclasses import dataclass
+import os
+import json
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -808,4 +810,54 @@ class PrismaticVLM(VLM):
         # Add to state dict keys for checkpoint saving
         if "moe_applied" not in self.all_module_keys:
             self.all_module_keys.append("moe_applied")
+
+    def save_pretrained(self, save_directory, save_config=True, **kwargs):
+        """
+        Save a MoE-LoRA model to a directory, so that it can be re-loaded using `from_pretrained()`.
+        
+        Args:
+            save_directory: Directory to which to save the model.
+            save_config: Whether to save the model configuration.
+        """
+        os.makedirs(save_directory, exist_ok=True)
+        
+        # Save model weights
+        model_state = {
+            "vision_backbone": self.vision_backbone.state_dict(),
+            "llm_backbone": self.llm_backbone.state_dict(),
+            "projector": self.projector.state_dict()
+        }
+        
+        # Save MoE-LoRA configuration
+        if self.use_moe_lora:
+            model_state["moe_config"] = {
+                "use_moe_lora": self.use_moe_lora,
+                "moe_applied": getattr(self, "moe_applied", False),
+                "moe_num_experts": self.moe_num_experts,
+                "moe_lora_rank": self.moe_lora_rank,
+                "moe_lora_alpha": self.moe_lora_alpha,
+                "moe_balance_weight": self.moe_balance_weight,
+                "dense_moe": self.dense_moe
+            }
+        
+        # Save the model weights
+        torch.save(model_state, os.path.join(save_directory, "pytorch_model.bin"))
+        
+        # Save config if requested
+        if save_config:
+            model_config = {
+                "model_id": self.model_id,
+                "arch_specifier": self.arch_specifier,
+                "use_moe_lora": self.use_moe_lora,
+                "moe_num_experts": getattr(self, "moe_num_experts", 4),
+                "moe_lora_rank": getattr(self, "moe_lora_rank", 32),
+                "moe_lora_alpha": getattr(self, "moe_lora_alpha", 16),
+                "moe_balance_weight": getattr(self, "moe_balance_weight", 0.01),
+                "dense_moe": getattr(self, "dense_moe", True),
+            }
+            
+            with open(os.path.join(save_directory, "config.json"), "w") as f:
+                json.dump(model_config, f, indent=2)
+        
+        return save_directory
 
