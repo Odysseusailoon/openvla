@@ -812,52 +812,67 @@ class PrismaticVLM(VLM):
             self.all_module_keys.append("moe_applied")
 
     def save_pretrained(self, save_directory, save_config=True, **kwargs):
-        """
-        Save a MoE-LoRA model to a directory, so that it can be re-loaded using `from_pretrained()`.
-        
-        Args:
-            save_directory: Directory to which to save the model.
-            save_config: Whether to save the model configuration.
-        """
+        """Save the model in HuggingFace format with MoE-LoRA support."""
         os.makedirs(save_directory, exist_ok=True)
-        
-        # Save model weights
-        model_state = {
-            "vision_backbone": self.vision_backbone.state_dict(),
-            "llm_backbone": self.llm_backbone.state_dict(),
-            "projector": self.projector.state_dict()
-        }
-        
-        # Save MoE-LoRA configuration
-        if self.use_moe_lora:
-            model_state["moe_config"] = {
+
+        # 1. Save model configuration
+        if save_config:
+            config = {
+                "model_id": self.model_id,
+                "arch_specifier": self.arch_specifier,
                 "use_moe_lora": self.use_moe_lora,
-                "moe_applied": getattr(self, "moe_applied", False),
                 "moe_num_experts": self.moe_num_experts,
                 "moe_lora_rank": self.moe_lora_rank,
                 "moe_lora_alpha": self.moe_lora_alpha,
                 "moe_balance_weight": self.moe_balance_weight,
-                "dense_moe": self.dense_moe
-            }
-        
-        # Save the model weights
-        torch.save(model_state, os.path.join(save_directory, "pytorch_model.bin"))
-        
-        # Save config if requested
-        if save_config:
-            model_config = {
-                "model_id": self.model_id,
-                "arch_specifier": self.arch_specifier,
-                "use_moe_lora": self.use_moe_lora,
-                "moe_num_experts": getattr(self, "moe_num_experts", 4),
-                "moe_lora_rank": getattr(self, "moe_lora_rank", 32),
-                "moe_lora_alpha": getattr(self, "moe_lora_alpha", 16),
-                "moe_balance_weight": getattr(self, "moe_balance_weight", 0.01),
-                "dense_moe": getattr(self, "dense_moe", True),
+                "dense_moe": self.dense_moe,
+                "moe_applied": getattr(self, "moe_applied", False),
+                "model_type": "openvla"  # Important for HF model identification
             }
             
             with open(os.path.join(save_directory, "config.json"), "w") as f:
-                json.dump(model_config, f, indent=2)
+                json.dump(config, f, indent=2)
+        
+        # 2. Create state dict with proper structure for HF
+        state_dict = {}
+        
+        # Include base model parameters
+        vision_state = self.vision_backbone.state_dict()
+        llm_state = self.llm_backbone.state_dict()
+        projector_state = self.projector.state_dict()
+        
+        # Prefix parameters appropriately for HF format
+        for k, v in vision_state.items():
+            state_dict[f"vision_backbone.{k}"] = v
+        
+        for k, v in llm_state.items():
+            state_dict[f"llm_backbone.{k}"] = v
+        
+        for k, v in projector_state.items():
+            state_dict[f"projector.{k}"] = v
+        
+        # 3. Extract MoE LoRA parameters explicitly if applied
+        if self.use_moe_lora and hasattr(self, "moe_applied") and self.moe_applied:
+            # Collect MoE parameters from LLM layers
+            for i, layer in enumerate(self.llm_backbone.llm.model.layers):
+                if hasattr(layer, 'mlp') and isinstance(layer.mlp, LoRA_MOE_LM):
+                    # Get MoE-specific state dict
+                    moe_state = layer.mlp.state_dict()
+                    
+                    # Add with proper prefix for this layer
+                    for k, v in moe_state.items():
+                        state_dict[f"llm_backbone.llm.model.layers.{i}.mlp.{k}"] = v
+        
+        # 4. Save the complete state dict
+        torch.save(state_dict, os.path.join(save_directory, "pytorch_model.bin"))
+        
+        # 5. Save tokenizer if available
+        if hasattr(self.llm_backbone, "tokenizer"):
+            self.llm_backbone.tokenizer.save_pretrained(save_directory)
+        
+        # 6. Save any preprocessor/image processor if available
+        if hasattr(self.vision_backbone, "image_processor"):
+            self.vision_backbone.image_processor.save_pretrained(save_directory)
         
         return save_directory
 
