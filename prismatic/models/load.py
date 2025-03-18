@@ -302,6 +302,10 @@ def load_vla(
             "dense_moe": dense_moe,
         })
     
+    # This is the fix - add the required positional argument
+    if "pretrained_checkpoint" not in from_pretrained_kwargs and checkpoint_pt is not None:
+        from_pretrained_kwargs["pretrained_checkpoint"] = checkpoint_pt
+    
     # Create VLA model
     vla = OpenVLA.from_pretrained(**from_pretrained_kwargs)
     

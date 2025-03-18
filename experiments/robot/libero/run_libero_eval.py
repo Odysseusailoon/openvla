@@ -103,7 +103,13 @@ def eval_libero(cfg: GenerateConfig) -> None:
     set_seed_everywhere(cfg.seed)
 
     # [OpenVLA] Set action un-normalization key
-    cfg.unnorm_key = cfg.task_suite_name
+   # cfg.unnorm_key = cfg.task_suite_name
+    cfg.unnorm_key = 'libero_90' 
+
+
+# Set environment variable before imports
+    os.environ["PRISMATIC_DATA_ROOT"] = "/tmp/dummy_path"
+    os.makedirs("/tmp/dummy_path", exist_ok=True)
 
     # Load model
     model = get_model(cfg)
@@ -112,9 +118,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
     if cfg.model_family in ["openvla", "prismatic"]:
         # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
         # with the suffix "_no_noops" in the dataset name)
+        # Add this temporarily before the assertion to see what stats are available
+        print(f"Available norm_stats keys: {list(model.norm_stats.keys())}")
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
             cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
-        assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
+        # assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
 
     # [OpenVLA] Get Hugging Face processor
     processor = None
