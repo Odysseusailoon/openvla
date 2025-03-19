@@ -111,7 +111,6 @@ class LoRA_MOE_LM(nn.Module): # for llm
 
 
     def forward(self, x):
-        # return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         logits = self.router(x)
         routing = F.softmax(logits, dim=-1)
         index = routing.max(-1, keepdim=True)[1]
@@ -131,7 +130,12 @@ class LoRA_MOE_LM(nn.Module): # for llm
             x = self.forward_lora_moe(x, self.original_module.down_proj, routing, self.moe_down)
         else:
             x = self.forward_lora_moe_sparse(x, self.original_module.down_proj, index, self.moe_down)
-        return x, (routing, expert_choice)
+        
+        # Store routing info as an attribute instead of returning it
+        self._last_routing_info = (routing, expert_choice)
+        
+        # Return only the tensor output
+        return x
 
     def state_dict(self, *args, **kwargs):
         """
