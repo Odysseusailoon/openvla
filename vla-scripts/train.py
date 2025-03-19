@@ -49,9 +49,7 @@ class TrainConfig:
     # fmt: off
 
     # VLAConfig (`prismatic/conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
-    vla: VLAConfig = field(
-        default_factory=VLAConfig.get_choice_class(VLARegistry.DINOSIGLIP_224PX_MX_OXE_MAGIC_SOUP_PLUS.vla_id)
-    )
+    vla: VLAConfig = field(default_factory=lambda: VLARegistry.get("prism-llama-7b-dino-224px-gelu-mlp"))
 
     # Directory Paths
     data_root_dir: Path = Path(                                     # Path to Open-X dataset directory
@@ -88,6 +86,9 @@ class TrainConfig:
     moe_lora_alpha: int = 16
     moe_balance_weight: float = 0.01
     dense_moe: bool = True
+
+    # Add the missing parameter
+    grad_accumulation_steps: int = 1  # Number of steps to accumulate gradients
 
     def __post_init__(self) -> None:
         """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
@@ -262,6 +263,7 @@ def train(cfg: TrainConfig) -> None:
         max_grad_norm=cfg.max_grad_norm,
         lr_scheduler_type=cfg.lr_scheduler_type,
         warmup_ratio=cfg.warmup_ratio,
+        grad_accumulation_steps=cfg.grad_accumulation_steps,
         enable_gradient_checkpointing=cfg.vla.enable_gradient_checkpointing,
         enable_mixed_precision_training=cfg.vla.enable_mixed_precision_training,
         reduce_in_full_precision=cfg.vla.reduce_in_full_precision,
