@@ -185,7 +185,6 @@ def train(cfg: TrainConfig) -> None:
         vision_backbone=vlm.vision_backbone,
         llm_backbone=vlm.llm_backbone,
         enable_mixed_precision_training=True,
-        arch_specifier=cfg.vla.arch_specifier,
         use_moe_lora=cfg.use_moe_lora,
         moe_num_experts=cfg.moe_num_experts,
         moe_lora_rank=cfg.moe_lora_rank,
