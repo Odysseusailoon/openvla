@@ -104,7 +104,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # [OpenVLA] Set action un-normalization key
    # cfg.unnorm_key = cfg.task_suite_name
-    cfg.unnorm_key = 'libero_90' 
+    # cfg.unnorm_key = 'libero_90' 
 
 
 # Set environment variable before imports
@@ -122,7 +122,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
         print(f"Available norm_stats keys: {list(model.norm_stats.keys())}")
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
             cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
-        # assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
+        assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
 
     # [OpenVLA] Get Hugging Face processor
     processor = None
