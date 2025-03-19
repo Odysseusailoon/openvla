@@ -88,7 +88,7 @@ class TrainingStrategy(ABC):
         assert (
             self.global_batch_size % self.per_device_batch_size == 0
         ), "Per-device batch size must evenly divide global batch size!"
-        self.grad_accumulation_steps = self.global_batch_size // self.per_device_batch_size // overwatch.world_size()
+        self.grad_accumulation_steps = 1
         if self.enable_mixed_precision_training:
             assert self.mixed_precision_dtype == torch.bfloat16, "Only BF16 mixed precision training is supported!"
             assert check_bloat16_supported(), "BFloat16 is not supported on this hardware; unset `mixed_precision`"
