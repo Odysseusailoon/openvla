@@ -1,8 +1,10 @@
 """Utils for evaluating the OpenVLA policy."""
 
 import json
+import math
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
@@ -13,6 +15,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.models.load import load_vla
 
 # Initialize important constants and pretty-printing mode in NumPy.
 ACTION_DIM = 7
@@ -26,6 +29,29 @@ OPENVLA_V01_SYSTEM_PROMPT = (
     "A chat between a curious user and an artificial intelligence assistant. "
     "The assistant gives helpful, detailed, and polite answers to the user's questions."
 )
+
+
+def get_prismatic_vla(cfg):
+    """Loads and returns a VLA model from checkpoint."""
+    # Prepare for model loading.
+    print(f"[*] Initializing Generation Playground with `{cfg.model_family}`")
+    hf_token = cfg.hf_token.read_text().strip() if isinstance(cfg.hf_token, Path) else os.environ[cfg.hf_token]
+    # set_seed(cfg.seed)
+    # Load VLA checkpoint.
+    print(f"Loading VLM from checkpoint: {cfg.pretrained_checkpoint}")
+    vla = load_vla(
+        cfg.pretrained_checkpoint,
+        hf_token=hf_token,
+        load_for_training=False,
+    )
+    for param in vla.parameters():
+        assert param.dtype == torch.float32, f"Loaded VLM parameter not in full precision: {param}"
+    # Cast to half precision.
+    vla.vision_backbone.to(dtype=vla.vision_backbone.half_precision_dtype)
+    vla.llm_backbone.to(dtype=vla.llm_backbone.half_precision_dtype)
+    vla.to(dtype=vla.llm_backbone.half_precision_dtype)
+    vla.to(DEVICE)
+    return vla
 
 
 def get_vla(cfg):
@@ -124,8 +150,34 @@ def crop_and_resize(image, crop_scale, batch_size):
     return image
 
 
+def apply_center_crop(im, t_h, t_w):
+    """
+    Source: https://github.com/ARISE-Initiative/robomimic/blob/5dee58f9cc1235010d0877142b54d0e82dd23986/robomimic/utils/obs_utils.py#L268
+
+    Takes a center crop of an image.
+
+    Args:
+        im (np.array or torch.Tensor): image of shape (..., height, width, channel)
+        t_h (int): height of crop
+        t_w (int): width of crop
+
+    Returns:
+        im (np.array or torch.Tensor): center cropped image
+    """
+    assert im.shape[-3] >= t_h and im.shape[-2] >= t_w
+    assert im.shape[-1] in [1, 3, 6]
+    crop_h = int((im.shape[-3] - t_h) / 2)
+    crop_w = int((im.shape[-2] - t_w) / 2)
+    return im[..., crop_h : crop_h + t_h, crop_w : crop_w + t_w, :]
+
+
 def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, center_crop=False):
     """Generates an action with the VLA policy."""
+
+    # only supports 1 image
+    if isinstance(obs["full_image"], list):
+        obs["full_image"] = obs["full_image"][0]
+
     image = Image.fromarray(obs["full_image"])
     image = image.convert("RGB")
 
@@ -167,4 +219,44 @@ def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, c
 
     # Get action.
     action = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
+    return action
+
+
+def get_prismatic_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, center_crop=False, **kwargs):
+    """Generates an action with the VLA policy."""
+
+    if not isinstance(obs["full_image"], list):
+        obs["full_image"] = [obs["full_image"]]
+
+    processed_images = []
+
+    for img in obs["full_image"]:
+        image = Image.fromarray(img)
+        image = image.convert("RGB")
+
+        # (If trained with image augmentations) Center crop image and then resize back up to original size.
+        # IMPORTANT: Let's say crop scale == 0.9. To get the new height and width (post-crop), we must multiply
+        #            the original height and width by sqrt(0.9) -- not 0.9!
+        if center_crop:
+            temp_image = np.array(image)  # (H, W, C)
+            crop_scale = 0.9
+            sqrt_crop_scale = math.sqrt(crop_scale)
+            temp_image_cropped = apply_center_crop(
+                temp_image,
+                t_h=int(sqrt_crop_scale * temp_image.shape[0]),
+                t_w=int(sqrt_crop_scale * temp_image.shape[1]),
+            )
+            temp_image = Image.fromarray(temp_image_cropped)
+            temp_image = temp_image.resize(
+                image.size, Image.Resampling.BILINEAR
+            )  # IMPORTANT: dlimp uses BILINEAR resize
+            image = temp_image
+
+        processed_images.append(image)
+
+    # extract for single image
+    if len(processed_images) == 1:
+        processed_images = processed_images[0]
+
+    action = vla.predict_action(processed_images, task_label, unnorm_key=unnorm_key, **kwargs)
     return action

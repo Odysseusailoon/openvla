@@ -51,6 +51,7 @@ class TrainingStrategy(ABC):
         reduce_in_full_precision: bool = False,
         mixed_precision_dtype: torch.dtype = torch.bfloat16,
         worker_init_fn: Optional[Callable[[int], None]] = None,
+        save_every_n_steps: Optional[int] = None,
         **_: str,
     ) -> None:
         self.vlm, self.device_id, self.stage = vlm, device_id, stage
@@ -78,11 +79,16 @@ class TrainingStrategy(ABC):
         # Optimizers & Scheduler (initialized in `run_setup`)
         self.optimizer, self.lr_scheduler = None, None
 
+        # how often to save checkpoints
+        self.save_every_n_steps = save_every_n_steps
+        if save_every_n_steps is not None:
+            assert save_every_n_steps > 0
+
         # Lightweight Validation
         assert (
             self.global_batch_size % self.per_device_batch_size == 0
         ), "Per-device batch size must evenly divide global batch size!"
-        self.grad_accumulation_steps = self.global_batch_size // self.per_device_batch_size // overwatch.world_size()
+        self.grad_accumulation_steps = 1
         if self.enable_mixed_precision_training:
             assert self.mixed_precision_dtype == torch.bfloat16, "Only BF16 mixed precision training is supported!"
             assert check_bloat16_supported(), "BFloat16 is not supported on this hardware; unset `mixed_precision`"
@@ -230,6 +236,13 @@ class TrainingStrategy(ABC):
                             dist.barrier()
 
                             return
+                        elif (
+                            self.save_every_n_steps is not None
+                            and (metrics.global_step + 1) % self.save_every_n_steps == 0
+                        ):
+
+                            self.save_checkpoint(metrics.run_dir, metrics.global_step, epoch, loss.item())
+                            dist.barrier()
 
                         # Update Progress Bar
                         progress.update()
@@ -313,7 +326,7 @@ class TrainingStrategy(ABC):
                 #   3) Compute masked accuracy as `(preds == logits) & mask` --> sum/divide by # unmasked!
                 action_preds = output.logits[:, self.vlm.vision_backbone.num_patches : -1].argmax(dim=2)
                 action_gt = batch["labels"][:, 1:].to(action_preds.device)
-                mask = action_gt > action_tokenizer.action_token_begin_idx
+                mask = (action_tokenizer.action_token_end_idx > action_gt) & (action_gt > action_tokenizer.action_token_begin_idx)
 
                 # Compute Accuracy
                 correct_preds = (action_preds == action_gt) & mask

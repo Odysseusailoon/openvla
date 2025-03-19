@@ -1,5 +1,6 @@
 """Utils for evaluating robot policies in various environments."""
 
+import math
 import os
 import random
 import time
@@ -8,6 +9,8 @@ import numpy as np
 import torch
 
 from experiments.robot.openvla_utils import (
+    get_prismatic_vla,
+    get_prismatic_vla_action,
     get_vla,
     get_vla_action,
 )
@@ -26,6 +29,17 @@ OPENVLA_V01_SYSTEM_PROMPT = (
 )
 
 
+def round_to_n(x, n=1):
+    # round scalar to n significant figure(s)
+    return round(x, -int(math.floor(math.log10(abs(x))) + (n - 1)))
+
+
+def hr_name(float_arg, fp=None):
+    if fp is not None:
+        float_arg = round_to_n(float_arg, n=fp)
+    return str(float_arg).replace(".", "_")
+
+
 def set_seed_everywhere(seed: int):
     """Sets the random seed for Python, NumPy, and PyTorch functions."""
     torch.manual_seed(seed)
@@ -39,10 +53,12 @@ def set_seed_everywhere(seed: int):
 
 def get_model(cfg, wrap_diffusion_policy_for_droid=False):
     """Load model for evaluation."""
-    if cfg.model_family == "openvla":
+    if cfg.model_family == "prismatic":
+        model = get_prismatic_vla(cfg)
+    elif cfg.model_family == "openvla":
         model = get_vla(cfg)
     else:
-        raise ValueError("Unexpected `model_family` found in config.")
+        raise ValueError(f"Unexpected `model_family` found in config ({cfg.model_family}).")
     print(f"Loaded model: {type(model)}")
     return model
 
@@ -53,7 +69,9 @@ def get_image_resize_size(cfg):
     If `resize_size` is an int, then the resized image will be a square.
     Else, the image will be a rectangle.
     """
-    if cfg.model_family == "openvla":
+    if cfg.model_family == "prismatic":
+        resize_size = 224
+    elif cfg.model_family == "openvla":
         resize_size = 224
     else:
         raise ValueError("Unexpected `model_family` found in config.")
@@ -62,7 +80,12 @@ def get_image_resize_size(cfg):
 
 def get_action(cfg, model, obs, task_label, processor=None):
     """Queries the model to get an action."""
-    if cfg.model_family == "openvla":
+    if cfg.model_family == "prismatic":
+        action = get_prismatic_vla_action(
+            model, processor, cfg.pretrained_checkpoint, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop
+        )
+        assert action.shape == (ACTION_DIM,)
+    elif cfg.model_family == "openvla":
         action = get_vla_action(
             model, processor, cfg.pretrained_checkpoint, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop
         )

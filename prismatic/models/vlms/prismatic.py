@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Type, Union
 
 import torch
-from PIL import Image
+from PIL.Image import Image as Img
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -26,6 +26,10 @@ from prismatic.models.backbones.vision import VisionBackbone
 from prismatic.models.vlms.base_vlm import VLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector
+from prismatic.models.backbones.llm.moe import LoRA_MOE_LM
+from dataclasses import dataclass
+import os
+import json
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -43,6 +47,12 @@ class PrismaticVLM(VLM):
         llm_backbone: LLMBackbone,
         enable_mixed_precision_training: bool = True,
         arch_specifier: str = "gelu-mlp",
+        use_moe_lora: bool = False,
+        moe_num_experts: int = 4,
+        moe_lora_rank: int = 32,
+        moe_lora_alpha: int = 16,
+        moe_balance_weight: float = 0.01,
+        dense_moe: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -67,6 +77,21 @@ class PrismaticVLM(VLM):
         else:
             raise ValueError(f"PrismaticVLM with `{arch_specifier = }` is not supported!")
 
+        # MoE LoRA configuration
+        self.use_moe_lora = use_moe_lora
+        self.moe_num_experts = moe_num_experts
+        self.moe_lora_rank = moe_lora_rank
+        self.moe_lora_alpha = moe_lora_alpha
+        self.moe_balance_weight = moe_balance_weight
+        self.dense_moe = dense_moe
+        
+        # Create a simple args object for MoE
+        @dataclass
+        class MoEArgs:
+            dense_moe: bool
+        
+        self.moe_args = MoEArgs(dense_moe=dense_moe)
+        
         # Trackers
         self.vision_backbone_requires_grad = False
 
@@ -103,7 +128,6 @@ class PrismaticVLM(VLM):
             arch_specifier=arch_specifier,
             **kwargs,
         )
-
         # Load from Checkpoint (Custom --> should load both *projector* and *llm* weights)
         model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")["model"]
         assert (
@@ -130,13 +154,39 @@ class PrismaticVLM(VLM):
         """
         This function sets `requires_grad_` on each of the component modules explicitly, depending on stage.
 
-        We support two separate stages --> "align" and "finetune".
+        We support multiple stages:
             => "align" --> vision_backbone*, llm_backbone* are frozen; only the `projector` is trained.
             => "finetune" --> vision_backbone* is frozen; both `projector` and `llm_backbone` are trained.
+            => "full-finetune" --> All components are trained.
+            => "moe-lora" --> vision_backbone* is frozen; apply MoE LoRA to LLM MLP layers and train.
 
-        :param stage: Pretraining stage in < "align" | "finetune" | "full-finetune" | "vla-train" | "vla-full-train" >
+        :param stage: Pretraining stage in < "align" | "finetune" | "full-finetune" | "vla-train" | "vla-full-train" | "moe-lora" >
         """
-        if stage == "align":
+        if stage == "moe-lora":
+            # Freeze vision backbone
+            self.vision_backbone.requires_grad_(False)
+            
+            # Freeze LLM backbone
+            self.llm_backbone.requires_grad_(False)
+            
+            # Apply MoE LoRA to LLM backbone
+            self.apply_moe_lora()
+            
+            # Projector can be trained
+            self.projector.requires_grad_(True)
+            
+            # Add to `self.trainable_module_keys`
+            self.trainable_module_keys = ["projector", "llm_backbone"]
+            
+            # Update Trackers
+            self.vision_backbone_requires_grad = False
+            
+            # Explicitly Log Frozen / Trainable Components
+            overwatch.info(f"[Frozen]    🥶 =>> Vision Backbone `{self.vision_backbone.identifier}`", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone (MoE LoRA) `{self.llm_backbone.identifier}`", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
+
+        elif stage == "align":
             self.vision_backbone.requires_grad_(False)
             self.llm_backbone.requires_grad_(False)
             self.projector.requires_grad_(True)
@@ -229,6 +279,30 @@ class PrismaticVLM(VLM):
             overwatch.info(f"[Frozen, except last layer] 🥶🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)  # noqa: E501
             overwatch.info(f"[TRAINABLE]                 🔥   =>> Projector `{self.arch_specifier}`", ctx_level=1)
             # fmt: on
+
+        elif stage == "moe-lora":
+            # Freeze vision backbone
+            self.vision_backbone.requires_grad_(False)
+            
+            # Freeze LLM backbone
+            self.llm_backbone.requires_grad_(False)
+            
+            # Apply MoE LoRA to LLM backbone
+            self.apply_moe_lora()
+            
+            # Projector can be trained
+            self.projector.requires_grad_(True)
+            
+            # Add to `self.trainable_module_keys`
+            self.trainable_module_keys = ["projector", "llm_backbone"]
+            
+            # Update Trackers
+            self.vision_backbone_requires_grad = False
+            
+            # Explicitly Log Frozen / Trainable Components
+            overwatch.info(f"[Frozen]    🥶 =>> Vision Backbone `{self.vision_backbone.identifier}`", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone (MoE LoRA) `{self.llm_backbone.identifier}`", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
 
         else:
             raise ValueError(f"Stage `{stage}` is not supported for LLaVa! Try < align | finetune >")
@@ -466,8 +540,13 @@ class PrismaticVLM(VLM):
             fused_attention_mask = torch.vstack([multimodal_attention_mask, unimodal_attention_mask])
             fused_labels = torch.vstack([multimodal_labels, unimodal_labels])
 
+        # Modify the LLM backbone handling for MoE-LoRA during inference
+        if self.use_moe_lora and not self.training:
+            # Monkey patch the forward method of MoE layers for inference
+            self._patch_moe_layers_for_inference(enable=True)
+        
         # Run LLM Forward --> returns CausalLMOutputWithPast!
-        return self.llm_backbone(
+        outputs = self.llm_backbone(
             input_ids=None,
             attention_mask=fused_attention_mask,
             position_ids=None,
@@ -479,6 +558,68 @@ class PrismaticVLM(VLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        
+        # Restore original behavior after inference
+        if self.use_moe_lora and not self.training:
+            self._patch_moe_layers_for_inference(enable=False)
+        
+        # Handle MoE LoRA balancing loss if applicable
+        if self.use_moe_lora and self.training:
+            # Extract routing information from LLM layers
+            routing_info = []
+            
+            # Collect routing information from each layer
+            if hasattr(self.llm_backbone, "llm") and hasattr(self.llm_backbone.llm, "model"):
+                if hasattr(self.llm_backbone.llm.model, "layers"):
+                    for layer in self.llm_backbone.llm.model.layers:
+                        if hasattr(layer, "mlp") and hasattr(layer.mlp, "forward") and isinstance(layer.mlp, LoRA_MOE_LM):
+                            # Store the routing information for later use
+                            if hasattr(layer.mlp, "_last_routing_info"):
+                                routing_info.append(layer.mlp._last_routing_info)
+            
+            if routing_info:
+                # Calculate expert balancing loss
+                moe_balance_loss = 0.0
+                batch_size = input_ids.shape[0] if input_ids is not None else fused_embeddings.shape[0]
+                
+                for routing, expert_choice in routing_info:
+                    # Calculate load balancing loss: encourage uniform expert utilization
+                    moe_balance_loss += (routing.mean(0) * expert_choice.mean(0)).sum()
+                
+                # Add balancing loss to the main loss
+                if hasattr(outputs, "loss") and outputs.loss is not None:
+                    outputs.loss = outputs.loss + (moe_balance_loss / len(routing_info)) * self.moe_balance_weight
+        
+        return outputs
+
+    def _patch_moe_layers_for_inference(self, enable=True):
+        """
+        Temporarily modify MoE layer forward methods during inference to handle tuple return values
+        """
+        if not hasattr(self, "_original_moe_forwards"):
+            self._original_moe_forwards = {}
+        
+        if hasattr(self.llm_backbone, 'llm') and hasattr(self.llm_backbone.llm, 'model'):
+            if hasattr(self.llm_backbone.llm.model, 'layers'):
+                for i, layer in enumerate(self.llm_backbone.llm.model.layers):
+                    if hasattr(layer, 'mlp') and isinstance(layer.mlp, LoRA_MOE_LM):
+                        if enable:
+                            # Store original forward method if not already stored
+                            if i not in self._original_moe_forwards:
+                                self._original_moe_forwards[i] = layer.mlp.forward
+                            
+                            # Replace with inference-friendly forward
+                            def make_inference_forward(original_forward):
+                                def inference_forward(x):
+                                    output, _ = original_forward(x)
+                                    return output
+                                return inference_forward
+                            
+                            layer.mlp.forward = make_inference_forward(layer.mlp.forward)
+                        else:
+                            # Restore original forward method
+                            if i in self._original_moe_forwards:
+                                layer.mlp.forward = self._original_moe_forwards[i]
 
     # === GenerationMixin Methods ===
     #   => Note: The following methods override the functionality of `transformers.GenerationMixin`; these expect the
@@ -591,7 +732,7 @@ class PrismaticVLM(VLM):
         return gen_texts if return_string_probabilities is None else gen_probabilities
 
     @torch.inference_mode()
-    def generate(self, image: Image, prompt_text: str, **kwargs: str) -> str:
+    def generate(self, image: Union[Img, List[Img]], prompt_text: str, **kwargs: str) -> str:
         # For now, only support generation with a batch size of 1 for simplicity
         image_transform, tokenizer = self.vision_backbone.image_transform, self.llm_backbone.tokenizer
 
@@ -612,6 +753,7 @@ class PrismaticVLM(VLM):
             generated_ids = super().generate(
                 input_ids=input_ids,            # Shape: [1, seq]
                 pixel_values=pixel_values,      # Shape: [1, 3, res, res] or Dict[str, Shape[1, 3, res, res]]
+                                                #  FOR MULTI-IMAGE Shape: [1, T, 3, res, res]
                 **kwargs
             )
             # fmt: on
@@ -619,3 +761,118 @@ class PrismaticVLM(VLM):
         generated_text = tokenizer.decode(generated_ids[0, input_ids.shape[1] :], skip_special_tokens=True).strip()
 
         return generated_text
+
+    def apply_moe_lora(self):
+        """
+        Apply MoE-LoRA adapter to the LLM backbone.
+        This method wraps the LLM's MLP layers with MoE-LoRA adapters without modifying
+        the original model structure.
+        """
+        if hasattr(self, 'moe_applied') and self.moe_applied:
+            overwatch.info("MoE-LoRA has already been applied, skipping", ctx_level=1)
+            return
+        
+        overwatch.info(f"Applying MoE-LoRA with {self.moe_num_experts} experts (rank: {self.moe_lora_rank})", ctx_level=1)
+        
+        # Track layers that have been modified
+        modified_layers = 0
+        
+        # Apply MoE-LoRA to LLM model layers
+        if hasattr(self.llm_backbone, 'llm') and hasattr(self.llm_backbone.llm, 'model'):
+            if hasattr(self.llm_backbone.llm.model, 'layers'):
+                for i, layer in enumerate(self.llm_backbone.llm.model.layers):
+                    if hasattr(layer, 'mlp'):
+                        # Store original MLP
+                        original_mlp = layer.mlp
+                        
+                        # Create MoE-LoRA wrapper
+                        moe_mlp = LoRA_MOE_LM(
+                            args=self.moe_args,
+                            lora_rank=self.moe_lora_rank,
+                            lora_alpha=self.moe_lora_alpha,
+                            num_experts=self.moe_num_experts,
+                            original_module=original_mlp
+                        )
+                        
+                        # Replace the MLP with our MoE-LoRA version
+                        layer.mlp = moe_mlp
+                        modified_layers += 1
+                        
+                        # Only modify every other layer if not using dense MoE
+                        if not self.dense_moe and modified_layers % 2 == 1:
+                            continue
+        
+        # Mark as applied to prevent multiple applications
+        self.moe_applied = True
+        
+        overwatch.info(f"MoE-LoRA successfully applied to {modified_layers} layers", ctx_level=1)
+        
+        # Add to state dict keys for checkpoint saving
+        if "moe_applied" not in self.all_module_keys:
+            self.all_module_keys.append("moe_applied")
+
+    def save_pretrained(self, save_directory, save_config=True, **kwargs):
+        """Save the model in HuggingFace format with MoE-LoRA support."""
+        os.makedirs(save_directory, exist_ok=True)
+
+        # 1. Save model configuration
+        if save_config:
+            config = {
+                "model_id": self.model_id,
+                "arch_specifier": self.arch_specifier,
+                "use_moe_lora": self.use_moe_lora,
+                "moe_num_experts": self.moe_num_experts,
+                "moe_lora_rank": self.moe_lora_rank,
+                "moe_lora_alpha": self.moe_lora_alpha,
+                "moe_balance_weight": self.moe_balance_weight,
+                "dense_moe": self.dense_moe,
+                "moe_applied": getattr(self, "moe_applied", False),
+                "model_type": "openvla"  # Important for HF model identification
+            }
+            
+            with open(os.path.join(save_directory, "config.json"), "w") as f:
+                json.dump(config, f, indent=2)
+        
+        # 2. Create state dict with proper structure for HF
+        state_dict = {}
+        
+        # Include base model parameters
+        vision_state = self.vision_backbone.state_dict()
+        llm_state = self.llm_backbone.state_dict()
+        projector_state = self.projector.state_dict()
+        
+        # Prefix parameters appropriately for HF format
+        for k, v in vision_state.items():
+            state_dict[f"vision_backbone.{k}"] = v
+        
+        for k, v in llm_state.items():
+            state_dict[f"llm_backbone.{k}"] = v
+        
+        for k, v in projector_state.items():
+            state_dict[f"projector.{k}"] = v
+        
+        # 3. Extract MoE LoRA parameters explicitly if applied
+        if self.use_moe_lora and hasattr(self, "moe_applied") and self.moe_applied:
+            # Collect MoE parameters from LLM layers
+            for i, layer in enumerate(self.llm_backbone.llm.model.layers):
+                if hasattr(layer, 'mlp') and isinstance(layer.mlp, LoRA_MOE_LM):
+                    # Get MoE-specific state dict
+                    moe_state = layer.mlp.state_dict()
+                    
+                    # Add with proper prefix for this layer
+                    for k, v in moe_state.items():
+                        state_dict[f"llm_backbone.llm.model.layers.{i}.mlp.{k}"] = v
+        
+        # 4. Save the complete state dict
+        torch.save(state_dict, os.path.join(save_directory, "pytorch_model.bin"))
+        
+        # 5. Save tokenizer if available
+        if hasattr(self.llm_backbone, "tokenizer"):
+            self.llm_backbone.tokenizer.save_pretrained(save_directory)
+        
+        # 6. Save any preprocessor/image processor if available
+        if hasattr(self.vision_backbone, "image_processor"):
+            self.vision_backbone.image_processor.save_pretrained(save_directory)
+        
+        return save_directory
+

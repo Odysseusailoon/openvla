@@ -14,6 +14,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
+from transformers.models.qwen2.tokenization_qwen2_fast import Qwen2TokenizerFast
 
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
@@ -34,19 +35,51 @@ class RLDSBatchTransform:
     image_transform: ImageTransform
     prompt_builder_fn: Type[PromptBuilder]
     predict_stop_token: bool = True
+    image_window_size: int = 1
+    use_wrist_image: bool = False
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"]
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
-        # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
+        # either a single or multi image, depending on image_window_size
+        if self.image_window_size == 1:
+            img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+            if self.use_wrist_image:
+                img = [img, Image.fromarray(rlds_batch["observation"]["image_wrist"][0])]
+        else:
+            img = [Image.fromarray(rlds_batch["observation"]["image_primary"][t]) for t in range(self.image_window_size)]
+            if self.use_wrist_image:
+                # wrist images are interleaved
+                wrist_img = [
+                    Image.fromarray(rlds_batch["observation"]["image_wrist"][t]) for t in range(self.image_window_size)
+                ]
+                img = [val for tup in zip(img, wrist_img) for val in tup]
+
+        conversation = []
+
+        # if there is no action horizon, remove it here.
+
+        if self.action_tokenizer.required_future_horizon == 0:
+            action = action[-1]
+        else:
+            # get the last FH + 1 actions (current action + future ones) if required
+            action = action[-self.action_tokenizer.required_future_horizon - 1 :]
+
+        tokenized_action = self.action_tokenizer(action)
+        raw_action_tokens = self.base_tokenizer(tokenized_action)["input_ids"]
+
+        conversation.extend(
+            [
+                {"from": "human", "value": f"What action should the robot take to {lang}?"},
+                {"from": "gpt", "value": tokenized_action},
+            ]
+        )
+        num_answer_tokens = len(raw_action_tokens)
+
+        # Construct Chat-based Prompt
         prompt_builder = self.prompt_builder_fn("openvla")
-        conversation = [
-            {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": self.action_tokenizer(action)},
-        ]
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
 
@@ -55,14 +88,18 @@ class RLDSBatchTransform:
         labels = list(input_ids)
 
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
-        #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
 
-        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        labels[: -(len(action) + 1)] = IGNORE_INDEX
+        # critical, some tokenizers have different numbers of "end tokens".
+        num_end_tokens = 1
+        if isinstance(self.base_tokenizer, Qwen2TokenizerFast):
+            # Qwen has <|im_end|><|endoftext|> for example
+            num_end_tokens = 2
+
+        labels[: -(num_answer_tokens + num_end_tokens)] = IGNORE_INDEX
         if not self.predict_stop_token:
-            labels[-1] = IGNORE_INDEX
+            labels[-num_end_tokens:] = IGNORE_INDEX
 
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name)
 
@@ -77,6 +114,9 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        future_action_window_size: int = 0,
+        image_window_size: int = 1,
+        load_camera_views: tuple = ("primary",),
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -92,7 +132,7 @@ class RLDSDataset(IterableDataset):
         per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
             self.data_root_dir,
             mixture_spec,
-            load_camera_views=("primary",),
+            load_camera_views=load_camera_views,
             load_depth=False,
             load_proprio=False,
             load_language=True,
@@ -100,10 +140,10 @@ class RLDSDataset(IterableDataset):
         )
         rlds_config = dict(
             traj_transform_kwargs=dict(
-                window_size=1,                                      # If we wanted to feed / predict more than one step
-                future_action_window_size=0,                        # For action chunking
-                skip_unlabeled=True,                                # Skip trajectories without language labels
-                goal_relabeling_strategy="uniform",                 # Goals are currently unused
+                window_size=image_window_size,                        # If we wanted to feed / predict more than one step
+                future_action_window_size=future_action_window_size,  # For action chunking
+                skip_unlabeled=True,                                  # Skip trajectories without language labels
+                goal_relabeling_strategy="uniform",                   # Goals are currently unused
             ),
             frame_transform_kwargs=dict(
                 resize_size=resize_resolution,

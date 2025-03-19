@@ -34,6 +34,7 @@ from prismatic.training import VLAMetrics, get_train_strategy
 from prismatic.util import set_global_seed
 from prismatic.vla import get_vla_dataset_and_collator
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from prismatic.models.vlms.prismatic import PrismaticVLM
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -48,9 +49,7 @@ class TrainConfig:
     # fmt: off
 
     # VLAConfig (`prismatic/conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
-    vla: VLAConfig = field(
-        default_factory=VLAConfig.get_choice_class(VLARegistry.DINOSIGLIP_224PX_MX_OXE_MAGIC_SOUP_PLUS.vla_id)
-    )
+    vla: VLAConfig = field(default_factory=lambda: VLARegistry.get("prism-llama-7b-dino-224px-gelu-mlp"))
 
     # Directory Paths
     data_root_dir: Path = Path(                                     # Path to Open-X dataset directory
@@ -77,8 +76,16 @@ class TrainConfig:
 
     # Tracking Parameters
     trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
-    wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
-    wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
+    wandb_project: str = "prismatic"                                  # Name of W&B project to log to (use default!)
+    wandb_entity: str = None                          # Name of entity to log under
+
+    # Add MoE LoRA parameters
+    use_moe_lora: bool = False
+    moe_num_experts: int = 4
+    moe_lora_rank: int = 32
+    moe_lora_alpha: int = 16
+    moe_balance_weight: float = 0.01
+    dense_moe: bool = True
 
     def __post_init__(self) -> None:
         """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
@@ -94,6 +101,12 @@ class TrainConfig:
         self.warmup_ratio = self.vla.warmup_ratio
 
         self.train_strategy = self.vla.train_strategy
+        self.save_every_n_steps = self.vla.save_every_n_steps
+
+        self.action_tokenizer = self.vla.action_tokenizer
+
+        self.image_sequence_len = self.vla.image_sequence_len
+        self.use_wrist_image = self.vla.use_wrist_image
 
         # [Validate] Assert on `expected_world_size`
         assert (
@@ -147,17 +160,40 @@ def train(cfg: TrainConfig) -> None:
             assert int(re.search("step-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_step
             assert int(re.search("epoch-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_epoch
 
-        vlm = load_vla(cfg.pretrained_checkpoint, hf_token=hf_token, load_for_training=True)
+        vlm = load_vla(
+            cfg.pretrained_checkpoint,
+            hf_token=hf_token,
+            load_for_training=True,
+            image_sequence_len=cfg.image_sequence_len,
+        )
 
     else:
-        vlm = load(cfg.vla.base_vlm, hf_token=hf_token, load_for_training=True)
+        vlm = load(
+            cfg.vla.base_vlm, hf_token=hf_token, load_for_training=True, image_sequence_len=cfg.image_sequence_len
+        )
 
     # [Validate] Model should be in Full Precision!
     for param in vlm.parameters():
         assert param.dtype == torch.float32, f"Loaded VLM parameter not in full precision: {param}"
 
-    # Determine training "stage" based on frozen vs unfrozen parameters --> supports different fine-tuning schemes!
-    if not cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
+    # Create VLM with MoE LoRA configuration if enabled
+    vlm = PrismaticVLM(
+        model_id=vla_id,
+        vision_backbone=vlm.vision_backbone,
+        llm_backbone=vlm.llm_backbone,
+        enable_mixed_precision_training=True,
+        use_moe_lora=cfg.use_moe_lora,
+        moe_num_experts=cfg.moe_num_experts,
+        moe_lora_rank=cfg.moe_lora_rank,
+        moe_lora_alpha=cfg.moe_lora_alpha,
+        moe_balance_weight=cfg.moe_balance_weight,
+        dense_moe=cfg.dense_moe,
+    )
+
+    # Determine training stage
+    if cfg.use_moe_lora:
+        stage = "moe-lora"
+    elif not cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
         stage = "vla-full-train"  # Full fine-tuning
     elif cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
         stage = "vla-train"  # Frozen vision encoder
@@ -197,6 +233,10 @@ def train(cfg: TrainConfig) -> None:
         default_image_resolution=vlm.vision_backbone.default_image_resolution,
         shuffle_buffer_size=cfg.vla.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        action_tokenizer=cfg.action_tokenizer,
+        # if using wrist images, we assume we passed in a 2x image sequence len
+        image_window_size=cfg.image_sequence_len // 2 if cfg.use_wrist_image else cfg.image_sequence_len,
+        use_wrist_image=cfg.use_wrist_image,  # will double the sequence length
     )
 
     # Save dataset statistics for de-normalization at inference time
@@ -223,6 +263,7 @@ def train(cfg: TrainConfig) -> None:
         enable_mixed_precision_training=cfg.vla.enable_mixed_precision_training,
         reduce_in_full_precision=cfg.vla.reduce_in_full_precision,
         worker_init_fn=worker_init_fn,
+        save_every_n_steps=cfg.save_every_n_steps,
     )
     train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(vla_dataset))
 

@@ -20,7 +20,6 @@ Run with:
     - [Multi-Node/AWS Sagemaker] Depends on your individual setup; file an issue if you have trouble!
 """
 
-import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,13 +28,12 @@ from typing import Optional, Tuple, Union
 import draccus
 import torch
 import torch.distributed as dist
-import yaml
+from torch.utils.data import DataLoader
 
 from prismatic.conf import DatasetConfig, DatasetRegistry, ModelConfig, ModelRegistry
 from prismatic.models import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform, get_vlm
 from prismatic.overwatch import initialize_overwatch
 from prismatic.preprocessing import get_dataset_and_collator
-from prismatic.training import Metrics, get_train_strategy
 from prismatic.util import set_global_seed
 
 # Disable Tokenizers Parallelism to Play Nice w/ PyTorch Multiprocessing DataLoaders
@@ -121,7 +119,7 @@ def pretrain(cfg: PretrainConfig) -> None:
     overwatch.info("Prismatic VLM Training :: Gathering Light")
 
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
-    torch.cuda.set_device(device_id := overwatch.local_rank())
+    # torch.cuda.set_device(device_id := overwatch.local_rank())
     torch.cuda.empty_cache()
 
     # Create Unique Run Name & Save Directory
@@ -135,14 +133,14 @@ def pretrain(cfg: PretrainConfig) -> None:
     overwatch.info('"Life is like a prism; what you see depends on how you turn the glass."', ctx_level=1)
     hf_token = cfg.hf_token.read_text().strip() if isinstance(cfg.hf_token, Path) else os.environ[cfg.hf_token]
     worker_init_fn = set_global_seed(cfg.seed, get_worker_init_fn=True)
-    os.makedirs(run_dir := (cfg.run_root_dir / cfg.run_id), exist_ok=True)
-    os.makedirs(cfg.run_root_dir / cfg.run_id / "checkpoints", exist_ok=True)
-    if overwatch.is_rank_zero():
-        # Additionally save a JSON version of the config
-        draccus.dump(cfg, open(run_dir / "config.yaml", "w"))
-        with open(run_dir / "config.yaml", "r") as f_yaml, open(run_dir / "config.json", "w") as f_json:
-            yaml_cfg = yaml.safe_load(f_yaml)
-            json.dump(yaml_cfg, f_json, indent=2)
+    # os.makedirs(run_dir := (cfg.run_root_dir / cfg.run_id), exist_ok=True)
+    # os.makedirs(cfg.run_root_dir / cfg.run_id / "checkpoints", exist_ok=True)
+    # if overwatch.is_rank_zero():
+    #     # Additionally save a JSON version of the config
+    #     draccus.dump(cfg, open(run_dir / "config.yaml", "w"))
+    #     with open(run_dir / "config.yaml", "r") as f_yaml, open(run_dir / "config.json", "w") as f_json:
+    #         yaml_cfg = yaml.safe_load(f_yaml)
+    #         json.dump(yaml_cfg, f_json, indent=2)
 
     # Load Vision Backbone --> on CPU, in Full Precision (initializing model, image_transform via TIMM)
     overwatch.info(f"Loading Vision Backbone [bold]{cfg.model.vision_backbone_id}[/] via TIMM ")
@@ -171,8 +169,8 @@ def pretrain(cfg: PretrainConfig) -> None:
     vlm.freeze_backbones(cfg.stage)
 
     # Load Weights from Checkpoint (depends on stage, config)
-    overwatch.info(f"Invoking `VLM.load_checkpoint()` for `{model_id}` => Training Stage: `{cfg.stage}`")
-    vlm.load_from_checkpoint(cfg.stage, run_dir, pretrained_checkpoint=cfg.pretrained_checkpoint)
+    # overwatch.info(f"Invoking `VLM.load_checkpoint()` for `{model_id}` => Training Stage: `{cfg.stage}`")
+    # vlm.load_from_checkpoint(cfg.stage, run_dir, pretrained_checkpoint=cfg.pretrained_checkpoint)
 
     # Get Dataset for Specified Stage
     overwatch.info(f"Creating Dataset `{cfg.dataset.dataset_id}` => Stage: `{cfg.stage}`")
@@ -186,50 +184,23 @@ def pretrain(cfg: PretrainConfig) -> None:
         padding_side=tokenizer.padding_side,
     )
 
-    # Create Train Strategy
-    overwatch.info(f"Initializing Train Strategy `{cfg.train_strategy}`")
-    train_strategy = get_train_strategy(
-        train_strategy=cfg.train_strategy,
-        vlm=vlm,
-        device_id=device_id,
-        stage=cfg.stage,
-        epochs=cfg.epochs,
-        max_steps=cfg.max_steps,
-        global_batch_size=cfg.global_batch_size,
-        per_device_batch_size=cfg.per_device_batch_size,
-        learning_rate=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        max_grad_norm=cfg.max_grad_norm,
-        lr_scheduler_type=cfg.lr_scheduler_type,
-        warmup_ratio=cfg.warmup_ratio,
-        enable_gradient_checkpointing=cfg.model.enable_gradient_checkpointing,
-        enable_mixed_precision_training=cfg.model.enable_mixed_precision_training,
-        reduce_in_full_precision=cfg.model.reduce_in_full_precision,
+    # Create a DataLoader =>> Set `num_workers` to 0; RLDS loader handles parallelism!
+    dataloader = DataLoader(
+        train_dataset,
+        batch_size=cfg.per_device_batch_size,
+        sampler=None,
+        collate_fn=collator,
+        num_workers=0,
         worker_init_fn=worker_init_fn,
-        save_every_n_steps=cfg.save_every_n_steps,
-    )
-    train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(train_dataset))
-
-    # Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
-    overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
-    metrics = Metrics(
-        cfg.trackers,
-        cfg.run_id,
-        run_dir,
-        draccus.encode(cfg),
-        cfg.stage,
-        wandb_project=cfg.wandb_project,
-        wandb_entity=cfg.wandb_entity,
-        grad_accumulation_steps=train_strategy.grad_accumulation_steps,
     )
 
-    # Run Training
-    overwatch.info("Starting Training Loop")
-    train_strategy.run_training(train_dataset, collator, metrics, stage=cfg.stage, seed=cfg.seed)
-
-    # Finalize
-    overwatch.info("Done with Training =>> Finalizing Metrics")
-    metrics.finalize()
+    # [Contract] DataLoader wraps RLDS Loader (`.as_numpy_iterator() =>> implicit `.repeat()`)
+    #   => This means looping over the DataLoader is basically "infinite" (so no outer loop over epochs).
+    #      Slightly breaks default PyTorch semantics, which is why we adaptively compute `epoch` below.
+    for batch in dataloader:
+        for i in range(len(batch["input_ids"])):
+            overwatch.info("INPUTS:")
+            print(vlm.llm_backbone.tokenizer.decode(batch["input_ids"][i]))
 
     # And... we're done!
     overwatch.info("... and that's all, folks!")
