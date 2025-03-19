@@ -177,18 +177,18 @@ def train(cfg: TrainConfig) -> None:
         assert param.dtype == torch.float32, f"Loaded VLM parameter not in full precision: {param}"
 
     # Create VLM with MoE LoRA configuration if enabled
-    vlm = PrismaticVLM(
-        model_id=vla_id,
-        vision_backbone=vlm.vision_backbone,
-        llm_backbone=vlm.llm_backbone,
-        enable_mixed_precision_training=True,
-        use_moe_lora=cfg.use_moe_lora,
-        moe_num_experts=cfg.moe_num_experts,
-        moe_lora_rank=cfg.moe_lora_rank,
-        moe_lora_alpha=cfg.moe_lora_alpha,
-        moe_balance_weight=cfg.moe_balance_weight,
-        dense_moe=cfg.dense_moe,
-    )
+    # vlm = PrismaticVLM(
+    #     model_id=vla_id,
+    #     vision_backbone=vlm.vision_backbone,
+    #     llm_backbone=vlm.llm_backbone,
+    #     enable_mixed_precision_training=True,
+    #     use_moe_lora=cfg.use_moe_lora,
+    #     moe_num_experts=cfg.moe_num_experts,
+    #     moe_lora_rank=cfg.moe_lora_rank,
+    #     moe_lora_alpha=cfg.moe_lora_alpha,
+    #     moe_balance_weight=cfg.moe_balance_weight,
+    #     dense_moe=cfg.dense_moe,
+    # )
 
     # Determine training stage
     if cfg.use_moe_lora:
