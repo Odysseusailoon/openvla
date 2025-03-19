@@ -111,6 +111,7 @@ class LoRA_MOE_LM(nn.Module): # for llm
 
 
     def forward(self, x):
+        # return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         logits = self.router(x)
         routing = F.softmax(logits, dim=-1)
         index = routing.max(-1, keepdim=True)[1]
